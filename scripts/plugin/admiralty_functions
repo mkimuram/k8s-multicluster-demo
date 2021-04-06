@@ -1,0 +1,156 @@
+CD_CLUSTER="cluster1"
+CD_NAMESPACE="default"
+LOCAL_TAG="local"
+
+CERTMGR_REPO="quay.io/jetstack/"
+CERTMGR_VERSION="v0.16.1"
+CERTMGR_CONTOLLER_IMG="${CERTMGR_REPO}cert-manager-controller"
+CERTMGR_WEBHOOK_IMG="${CERTMGR_REPO}cert-manager-webhook"
+CERTMGR_INJECTOR_IMG="${CERTMGR_REPO}cert-manager-cainjector"
+
+ADM_REPO="quay.io/admiralty/"
+ADM_VERSION="0.13.2"
+ADM_AGENT_IMG="${ADM_REPO}multicluster-scheduler-agent"
+ADM_SCHEDULER_IMG="${ADM_REPO}multicluster-scheduler-scheduler"
+ADM_RM_FINALIZERS_IMG="${ADM_REPO}multicluster-scheduler-remove-finalizers"
+ADM_RESTARTER_IMG="${ADM_REPO}multicluster-scheduler-restarter"
+
+admiralty_images=(
+  # cert-manager dependency
+  "${CERTMGR_CONTOLLER_IMG}:${CERTMGR_VERSION}"
+  "${CERTMGR_WEBHOOK_IMG}:${CERTMGR_VERSION}"
+  "${CERTMGR_INJECTOR_IMG}:${CERTMGR_VERSION}"
+  # admiralty open source
+  "${ADM_AGENT_IMG}:${ADM_VERSION}"
+  "${ADM_SCHEDULER_IMG}:${ADM_VERSION}"
+  "${ADM_RM_FINALIZERS_IMG}:${ADM_VERSION}"
+  "${ADM_RESTARTER_IMG}:${ADM_VERSION}"
+)
+
+# Mask helm to use cluster context if the variable is set and context isn't specified,
+# otherwise use the config context as always.
+function helm() {
+    if [[ -n "${cluster}" && ! "${*}" =~ "kube-context" ]]; then
+        command helm --kube-context="${cluster}" "$@"
+    else
+        command helm "$@"
+    fi
+}
+
+function local_image_name() {
+	local image_name=$1
+	echo "localhost:5000/${image_name##*/}"
+}
+
+function import_orig_image() {
+	local orig_image=$1
+	local image_name=${orig_image%:*}
+	local local_image="$(local_image_name ${image_name}):${LOCAL_TAG}"
+
+	docker pull "${orig_image}"
+	docker tag "${orig_image}" "${local_image}"
+	docker push "${local_image}"
+}
+
+function import_admiralty_images() {
+	for image in "${admiralty_images[@]}"; do
+		import_orig_image ${image} 
+	done
+}
+
+function setup_admiralty_helm() {
+	command helm repo add jetstack https://charts.jetstack.io
+	command helm repo add admiralty https://charts.admiralty.io
+	command helm repo update
+}
+
+function install_certmanager() {
+	run_all_clusters kubectl create namespace cert-manager
+	run_all_clusters kubectl apply --validate=false -f https://github.com/jetstack/cert-manager/releases/download/v0.16.1/cert-manager.crds.yaml
+
+	run_all_clusters helm install cert-manager jetstack/cert-manager \
+	    --namespace cert-manager \
+		--set image.repository=$(local_image_name "${CERTMGR_CONTOLLER_IMG}") \
+		--set image.tag="${LOCAL_TAG}" \
+		--set webhook.image.repository=$(local_image_name "${CERTMGR_WEBHOOK_IMG}") \
+		--set webhook.image.tag="${LOCAL_TAG}" \
+		--set cainjector.image.repository=$(local_image_name "${CERTMGR_INJECTOR_IMG}") \
+		--set cainjector.image.tag="${LOCAL_TAG}" \
+	    --version "${CERTMGR_VERSION}" \
+	    --wait --debug
+}
+
+function install_admiralty() {
+	run_all_clusters kubectl create namespace admiralty
+
+	run_all_clusters helm install admiralty admiralty/multicluster-scheduler \
+    	--namespace admiralty \
+		--set controllerManager.image.repository=$(local_image_name "${ADM_AGENT_IMG}") \
+		--set controllerManager.image.tag="${LOCAL_TAG}" \
+		--set scheduler.image.repository=$(local_image_name "${ADM_SCHEDULER_IMG}") \
+		--set scheduler.image.tag="${LOCAL_TAG}" \
+		--set postDeleteJob.image.repository=$(local_image_name "${ADM_RM_FINALIZERS_IMG}") \
+		--set postDeleteJob.image.tag="${LOCAL_TAG}" \
+		--set restarter.image.repository=$(local_image_name "${ADM_RESTARTER_IMG}") \
+		--set restarter.image.tag="${LOCAL_TAG}" \
+	    --version "${ADM_VERSION}" \
+    	--wait --debug
+}
+
+function configure_admiralty() {
+	for cluster in "${clusters[@]}"; do
+		if [ "${cluster}" == "${CD_CLUSTER}" ];then
+			continue
+		fi
+
+		with_context ${cluster} kubectl create serviceaccount "${CD_CLUSTER}"
+
+		SECRET_NAME=$(with_context ${cluster} kubectl get serviceaccount "${CD_CLUSTER}" \
+			--output json | \
+			jq -r '.secrets[0].name')
+
+		TOKEN=$(with_context ${cluster} kubectl get secret $SECRET_NAME \
+			--output json | \
+			jq -r '.data.token' | \
+			base64 --decode)
+
+		IP=$(docker inspect "${cluster}-control-plane" \
+			--format "{{ .NetworkSettings.Networks.kind.IPAddress }}")
+
+		CONFIG=$(with_context ${cluster} kubectl config view \
+			--minify --raw --output json | \
+			jq '.users[0].user={token:"'$TOKEN'"} | .clusters[0].cluster.server="https://'$IP':6443"')
+
+		cat <<EOF | with_context ${cluster} kubectl apply -f - 
+apiVersion: multicluster.admiralty.io/v1alpha1
+kind: Source
+metadata:
+  name: ${CD_CLUSTER}
+spec:
+  serviceAccountName: ${CD_CLUSTER}
+EOF
+
+		with_context "${CD_CLUSTER}" kubectl create secret generic ${cluster} \
+		      --from-literal=config="$CONFIG"
+
+		cat <<EOF | with_context "${CD_CLUSTER}" kubectl apply -f - 
+apiVersion: multicluster.admiralty.io/v1alpha1
+kind: Target
+metadata:
+  name: ${cluster}
+spec:
+  kubeconfigSecret:
+    name: ${cluster}
+EOF
+
+	done
+}
+
+function deploy_admiralty() {
+	import_admiralty_images
+	setup_admiralty_helm
+	install_certmanager
+	install_admiralty
+	configure_admiralty
+	with_context "${CD_CLUSTER}" kubectl label ns "${CD_NAMESPACE}" multicluster-scheduler=enabled
+}

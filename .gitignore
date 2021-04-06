@@ -1,0 +1,12 @@
+/vendor
+.dapper
+.idea
+.shflags
+/bin
+/package/.image.*
+output
+dist
+junit.xml
+*.out
+*.coverprofile
+*~

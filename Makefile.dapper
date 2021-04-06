@@ -1,0 +1,24 @@
+# This Makefile contains the rules required to set up our
+# Dapper-based build environment; it can be copied as-is to
+# other projects (and needs to be copied, it can't be shared
+# via the Dapper image since it's needed to retrieve the image)
+
+export MAKEFLAGS
+
+.dapper:
+	@echo Downloading dapper
+	@curl -sL https://releases.rancher.com/dapper/latest/dapper-`uname -s`-`uname -m` > .dapper.tmp
+	@@chmod +x .dapper.tmp
+	@./.dapper.tmp -v
+	@mv .dapper.tmp .dapper
+
+# Only run command line goals in dapper (except things that have to run outside of dapper).
+# Otherwise, make applies this rule to various files and tries to build them in dapper (which doesn't work, obviously).
+$(filter-out .dapper shell $(NON_DAPPER_GOALS),$(MAKECMDGOALS)): .dapper
+	-docker network create -d bridge kind
+	+./.dapper -m bind make --debug=b $@
+
+shell: .dapper
+	./.dapper -m bind -s
+
+.PHONY: shell
